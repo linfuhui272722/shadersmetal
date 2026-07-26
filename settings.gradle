@@ -1,0 +1,17 @@
+pluginManagement {
+    repositories {
+        // 1. 优先使用 Fabric 官方仓库
+        maven { url = uri("https://maven.fabricmc.net/") }
+        maven { url = uri("https://libraries.minecraft.net/") } 
+        // 2. Gradle 插件门户（备用）
+        gradlePluginPortal()
+        // 3. Maven 中央仓库
+        mavenCentral()
+    }
+}
+
+// 移除 dependencyResolutionManagement 块
+// 让 Gradle 使用默认的仓库解析策略，允许 Fabric Loom 添加其必要的本地仓库
+// 这样才能找到 splitEnvironmentSourceSets 生成的 minecraft-common 等文件
+
+rootProject.name = "MetallumShaders"

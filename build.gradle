@@ -1,0 +1,128 @@
+plugins {
+    id 'net.fabricmc.fabric-loom' version '1.17.13'
+    id 'maven-publish'
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+    archivesName = project.archives_base_name
+}
+
+repositories {
+    mavenCentral()
+    maven { url = 'https://maven.fabricmc.net/' }
+    maven { url = 'https://libraries.minecraft.net/' }
+}
+
+loom {
+    // 不使用 splitEnvironmentSourceSets()。
+    // 所有代码（含客户端代码）都在 src/main/java/ 下，
+    // main 源集需要看到 net.minecraft.client.* 类。
+    // Loom 会自动把 Minecraft merged jar 加到 main 源集的编译类路径上。
+    mods {
+        "metallum_shaders" {
+            sourceSet sourceSets.main
+        }
+    }
+}
+
+dependencies {
+    // Minecraft 26.2 —— 无混淆，不需要 mappings 依赖。
+    // Loom 会自动下载 MC jar、合并 client+server、加到 compileClasspath。
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+
+    // Fabric Loader + Fabric API
+    // 用 implementation（非 modImplementation）。MC 26.2 无混淆，
+    // Loom 不需要做 remap，implementation 即可。
+    implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+
+    // Metallum —— Metal API 桥接 mod（本地 jar）
+    implementation files('libs/metallum-1.0.1.jar')
+
+    // Sodium —— 仅编译期依赖，不打包进 jar
+    compileOnly files('libs/sodium-fabric-0.9.1+mc26.2.jar')
+}
+
+// Java 25 toolchain —— MC 26.2 需要 Java 25
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(project.java_version.toInteger())
+        vendor = JvmVendorSpec.ADOPTIUM
+    }
+    withSourcesJar()
+    sourceCompatibility = JavaVersion.VERSION_25
+    targetCompatibility = JavaVersion.VERSION_25
+}
+
+tasks.withType(JavaCompile).configureEach {
+    it.options.encoding = 'UTF-8'
+    it.options.release = project.java_version.toInteger()
+}
+
+processResources {
+    inputs.property "version", project.version
+    filesMatching("fabric.mod.json") {
+        expand "version": project.version
+    }
+}
+
+// Native dylib 由 codemagic.yaml 的 "Build native Metal JNI shim" 步骤
+// 预先编译并放到 src/main/resources/native/macos-arm64/ 下。
+// processResources 会自动把它打进 jar，不需要在 build.gradle 里再做。
+// 下面这段仅用于本地开发时在 macOS 上编译 dylib（CI 不依赖它）。
+
+def nativeSrcDir = file('src/main/cpp')
+def nativeOutDir = file('build/native')
+
+task buildNativeArm64(type: Exec) {
+    group = 'build'
+    description = 'Compile the Metal JNI shim for ARM64 (local dev only).'
+    onlyIf { System.getProperty('os.name').toLowerCase().contains('mac') }
+    outputs.file("${nativeOutDir}/macos-arm64/libmetallum_shaders.dylib")
+    inputs.file("${nativeSrcDir}/metallum_shaders.cpp")
+    doFirst {
+        file("${nativeOutDir}/macos-arm64").mkdirs()
+        def sdk = ['xcrun', '--sdk', 'macosx', '--show-sdk-path'].execute().text.trim()
+        def javaHome = System.getenv('JAVA_HOME') ?: System.getProperty('java.home')
+        commandLine 'clang++',
+            '-x', 'objective-c++', '-std=c++17', '-stdlib=libc++', '-fobjc-arc',
+            '-arch', 'arm64',
+            '-I', "${sdk}/System/Library/Frameworks/Metal.framework/Headers",
+            '-I', "${sdk}/System/Library/Frameworks/Foundation.framework/Headers",
+            '-I', "${javaHome}/include",
+            '-I', "${javaHome}/include/darwin",
+            '-F', "${sdk}/System/Library/Frameworks",
+            '-framework', 'Metal', '-framework', 'Foundation',
+            '-shared', '-dynamiclib',
+            '-o', "${nativeOutDir}/macos-arm64/libmetallum_shaders.dylib",
+            "${nativeSrcDir}/metallum_shaders.cpp"
+    }
+}
+
+task buildNative {
+    group = 'build'
+    description = 'Compile the Metal JNI shim (ARM64 only, local dev).'
+    dependsOn buildNativeArm64
+}
+
+// 本地开发时可以把 dylib 复制到 resources 目录
+task copyNativeToResources {
+    group = 'build'
+    dependsOn buildNativeArm64
+    doLast {
+        def dest = file('src/main/resources/native/macos-arm64')
+        dest.mkdirs()
+        copy {
+            from "${nativeOutDir}/macos-arm64/libmetallum_shaders.dylib"
+            into dest
+        }
+        println "Copied dylib to ${dest}"
+    }
+}
+
+tasks.withType(ProcessResources) {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}

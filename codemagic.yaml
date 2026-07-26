@@ -1,0 +1,245 @@
+# codemagic.yaml
+# CI configuration for building MetallumShaders on CodeMagic.
+# Built exclusively for macOS ARM64 (Apple Silicon).
+# Updated for Minecraft 26.2 with Java 25 and Gradle 9.5.1.
+# Includes local dependencies for Metallum and Sodium.
+
+workflows:
+  metallum-shaders-build:
+    name: Metallum Shaders Build
+    max_build_duration: 30
+    instance_type: mac_mini_m2
+    environment:
+      # Java 25 is required for Minecraft 26.2
+      # Gradle 9.5.1+ is required for Fabric Loom 1.17+
+      vars:
+        JAVA_VERSION: "25"
+        GRADLE_VERSION: "9.5.1"
+      groups:
+        - metallum_credentials
+      xcode: latest
+    triggering:
+      events:
+        - push
+        - pull_request
+      branch_patterns:
+        - pattern: main
+          include: true
+        - pattern: develop
+          include: true
+      cancel_previous_builds: true
+    cache:
+      cache_paths:
+        - ~/.gradle/caches
+        - ~/.gradle/wrapper
+        - build/
+        - .gradle/
+    scripts:
+      - name: Install Java 25 (Adoptium)
+        script: |
+          #!/usr/bin/env bash
+          set -e
+          
+          echo "=== Installing Java 25 (Adoptium) ==="
+          
+          # Install Temurin 25
+          brew tap homebrew/cask-versions 2>/dev/null || true
+          brew install --cask temurin@25 2>/dev/null || true
+          
+          # Set JAVA_HOME
+          export JAVA_HOME=/Library/Java/JavaVirtualMachines/temurin-25.jdk/Contents/Home
+          
+          # Force link binaries
+          sudo ln -sf $JAVA_HOME/bin/java /usr/local/bin/java
+          sudo ln -sf $JAVA_HOME/bin/javac /usr/local/bin/javac
+          
+          # Persist environment variables for ALL subsequent steps
+          echo "JAVA_HOME=$JAVA_HOME" >> $CM_ENV
+          echo "PATH=$JAVA_HOME/bin:$PATH" >> $CM_ENV
+          
+          # Verify installation
+          echo "Verifying Java version:"
+          java -version
+          echo "Java installation complete."
+
+      - name: Download Metallum dependency jar
+        script: |
+          #!/usr/bin/env bash
+          set -e
+          mkdir -p libs
+          if [ ! -f libs/metallum-1.0.1.jar ]; then
+            echo "Downloading Metallum jar from GitHub releases..."
+            curl -L -o libs/metallum-1.0.1.jar \
+              "https://github.com/EternityQwQ/MetalUniversal/releases/download/MetalUniversal_1.0.1/metallum-1.0.1.jar" \
+              || echo "WARNING: could not download Metallum jar; build will use a stub."
+            
+            if [ ! -s libs/metallum-1.0.1.jar ]; then
+              mkdir -p tmp-stub/META-INF
+              cat > tmp-stub/META-INF/MANIFEST.MF <<EOF
+          Manifest-Version: 1.0
+          EOF
+              (cd tmp-stub && jar cf ../libs/metallum-1.0.1.jar META-INF/MANIFEST.MF)
+              rm -rf tmp-stub
+            fi
+          fi
+          ls -la libs/
+
+      - name: Download Sodium dependency jar
+        script: |
+          #!/usr/bin/env bash
+          set -e
+          mkdir -p libs
+          if [ ! -f libs/sodium-fabric-0.9.1+mc26.2.jar ]; then
+            echo "Downloading Sodium jar from Modrinth..."
+            curl -L -o libs/sodium-fabric-0.9.1+mc26.2.jar \
+              "https://cdn.modrinth.com/data/AANobbMI/versions/2Yom1N68/sodium-fabric-0.9.1%2Bmc26.2.jar" \
+              || echo "WARNING: could not download Sodium jar; build will use a stub."
+            
+            if [ ! -s libs/sodium-fabric-0.9.1+mc26.2.jar ]; then
+              mkdir -p tmp-stub/META-INF
+              cat > tmp-stub/META-INF/MANIFEST.MF <<EOF
+          Manifest-Version: 1.0
+          EOF
+              (cd tmp-stub && jar cf ../libs/sodium-fabric-0.9.1+mc26.2.jar META-INF/MANIFEST.MF)
+              rm -rf tmp-stub
+            fi
+          fi
+          ls -la libs/
+
+      - name: Setup Gradle Wrapper
+        script: |
+          #!/usr/bin/env bash
+          set -e
+          
+          # Ensure JAVA_HOME is set
+          export JAVA_HOME=${JAVA_HOME:-/Library/Java/JavaVirtualMachines/temurin-25.jdk/Contents/Home}
+          export PATH=$JAVA_HOME/bin:$PATH
+          
+          # Check if gradle wrapper directory exists
+          if [ ! -d "gradle/wrapper" ]; then
+            echo "Creating gradle/wrapper directory..."
+            mkdir -p gradle/wrapper
+          fi
+          
+          # Check if gradle-wrapper.jar exists
+          if [ ! -f "gradle/wrapper/gradle-wrapper.jar" ]; then
+            echo "Downloading gradle-wrapper.jar for Gradle 9.5.1..."
+            curl -L -o gradle/wrapper/gradle-wrapper.jar \
+              "https://github.com/gradle/gradle/raw/v9.5.1/gradle/wrapper/gradle-wrapper.jar" \
+              || {
+                echo "Failed to download gradle-wrapper.jar, generating it..."
+                # Use Gradle to generate the wrapper
+                if command -v gradle &> /dev/null; then
+                  gradle wrapper --gradle-version 9.5.1 --distribution-type bin
+                else
+                  echo "ERROR: Gradle not found and gradle-wrapper.jar download failed"
+                  exit 1
+                fi
+              }
+          fi
+          
+          # Create or update gradle-wrapper.properties
+          cat > gradle/wrapper/gradle-wrapper.properties <<EOF
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-9.5.1-bin.zip
+          networkTimeout=10000
+          validateDistributionUrl=true
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          EOF
+          
+          echo "Gradle wrapper setup complete for Gradle 9.5.1."
+
+      - name: Grant execute permission for gradlew
+        script: |
+          chmod +x ./gradlew
+
+      - name: Build native Metal JNI shim (ARM64 only)
+        script: |
+          #!/usr/bin/env bash
+          set -e
+          
+          # Ensure JAVA_HOME is set
+          export JAVA_HOME=${JAVA_HOME:-/Library/Java/JavaVirtualMachines/temurin-25.jdk/Contents/Home}
+          
+          echo "Building native Metal JNI shim for ARM64"
+          
+          mkdir -p build/native/macos-arm64
+
+          SRC=src/main/cpp/metallum_shaders.cpp
+          SDK=$(xcrun --sdk macosx --show-sdk-path)
+          FRAMEWORKS="-F $SDK/System/Library/Frameworks -framework Foundation -framework Metal"
+          INCLUDES="-I$SDK/System/Library/Frameworks/Metal.framework/Headers -I$SDK/System/Library/Frameworks/Foundation.framework/Headers -I$JAVA_HOME/include -I$JAVA_HOME/include/darwin"
+
+          # arm64 Build —— 必须带 -fobjc-arc（源码用了 ARC 语义）和 -std=c++17
+          clang++ -x objective-c++ -std=c++17 -stdlib=libc++ -fobjc-arc \
+            -arch arm64 -dynamiclib \
+            $INCLUDES $FRAMEWORKS \
+            -o build/native/macos-arm64/libmetallum_shaders.dylib $SRC
+
+          # Copy into resources so the jar bundles them
+          mkdir -p src/main/resources/native/macos-arm64
+          cp build/native/macos-arm64/libmetallum_shaders.dylib \
+            src/main/resources/native/macos-arm64/
+          echo "Native arm64 dylib built and bundled."
+
+      - name: Build mod jar
+        script: |
+          #!/usr/bin/env bash
+          set -e
+          
+          # Explicitly set JAVA_HOME for this step
+          export JAVA_HOME=/Library/Java/JavaVirtualMachines/temurin-25.jdk/Contents/Home
+          export PATH=$JAVA_HOME/bin:$PATH
+          
+          echo "=== Environment Check ==="
+          echo "JAVA_HOME: $JAVA_HOME"
+          echo "Java version:"
+          $JAVA_HOME/bin/java -version
+          echo "Current Java version:"
+          java -version
+          
+          # CRITICAL: Stop all Gradle daemons to ensure new Java version is used
+          echo "Stopping all Gradle daemons..."
+          ./gradlew --stop || true
+          
+          # Verify Gradle wrapper
+          if [ ! -f "gradle/wrapper/gradle-wrapper.jar" ]; then
+            echo "ERROR: gradle-wrapper.jar still missing after setup step"
+            exit 1
+          fi
+          
+          # Build with explicit Java version and Gradle 9.5.1
+          echo "Building mod jar with Java 25 and Gradle 9.5.1..."
+          # Added --info flag for better debugging output
+          ./gradlew clean build --no-daemon --stacktrace --info \
+            -Dorg.gradle.java.home=$JAVA_HOME \
+            -Dorg.gradle.jvmargs=-Xmx4g
+
+      - name: Verify jar contents
+        script: |
+          #!/usr/bin/env bash
+          set -e
+          JAR=$(ls build/libs/metallum-shaders-*.jar | head -n1)
+          echo "Built jar: $JAR"
+          jar tf "$JAR" | head -50
+          echo "----"
+          echo "Shader files:"
+          jar tf "$JAR" | grep -E '\.(metal|metalh)$' || true
+          echo "----"
+          echo "Native libs:"
+          jar tf "$JAR" | grep -E '\.dylib$' || echo "(no dylibs found)"
+
+    artifacts:
+      - build/libs/*.jar
+      - build/native/**/*.dylib
+      - build/reports/**/*.html
+
+    publishing:
+      email:
+        recipients:
+          - user@example.com
+        notify:
+          success: true
+          failure: true
